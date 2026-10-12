@@ -1,0 +1,11 @@
+name: keep-awake
+# Free uptime ping: Render's free tier sleeps after 15 min idle, which would wipe the offline cache.
+on:
+  schedule: [{ cron: "*/10 * * * *" }]
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: curl -fsS -m 60 https://talk-scoreboard.onrender.com/healthz || curl -fsS -m 90 https://talk-scoreboard.onrender.com/healthz

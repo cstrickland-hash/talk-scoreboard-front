@@ -32,8 +32,51 @@ async function loadTarget() {
 }
 loadTarget(); setInterval(loadTarget, 30000);
 const HOP = new Set(["host", "connection", "keep-alive", "transfer-encoding", "upgrade", "content-length", "accept-encoding"]);
+
+// ---- Offline mode (Oct 12 2026): keeps the site + swipe page up when the box is unreachable. ----
+// Every 200 GET answered through the relay is cached in memory (key = path + query minus t/v cache-busters);
+// the box also pushes a full snapshot every 5 min (/__relay/cache). When no relay agent has checked in,
+// GETs are served from this cache and swipe approvals/edits are queued here until the box drains them
+// (/__relay/queue). Only an exact cached URL is served, so token-gated pages stay gated by the same token.
+const CACHE = new Map(); let cacheBytes = 0; const CACHE_MAX = 150 * 1024 * 1024;
+const PENDING = []; let adminHash = "";
+const sha = (x) => crypto.createHash("sha256").update(String(x)).digest("hex");
+function ckey(u) { try { const x = new URL(u, "http://h"); x.searchParams.delete("t"); x.searchParams.delete("v"); x.searchParams.sort(); return x.pathname + (x.search || ""); } catch (e) { return u; } }
+function cput(u, m) {
+  const k = ckey(u), b = Buffer.from(m.body || "", "base64"); if (b.length > 8 * 1024 * 1024) return;
+  const old = CACHE.get(k); if (old) cacheBytes -= old.b.length;
+  const h = {}; for (const [a, v] of Object.entries(m.headers || {})) if (!HOP.has(a) && a !== "content-encoding") h[a] = v;
+  CACHE.set(k, { h, b, at: Date.now() }); cacheBytes += b.length;
+  while (cacheBytes > CACHE_MAX && CACHE.size) { const [fk, fv] = CACHE.entries().next().value; CACHE.delete(fk); cacheBytes -= fv.b.length; }
+}
+function tokenOf(u) { try { return new URL(u, "http://h").searchParams.get("k") || ""; } catch (e) { return ""; } }
+function patchSwipe(u, fn) { // update every cached /api/swipe list for this token
+  for (const [k, v] of CACHE) if (k.startsWith("/api/swipe?") || k === "/api/swipe") {
+    try { const j = JSON.parse(v.b.toString()); fn(j); j.count = (j.cards || []).length; const nb = Buffer.from(JSON.stringify(j)); cacheBytes += nb.length - v.b.length; v.b = nb; } catch (e) { }
+  }
+}
+function offline(req, res, body) {
+  const u = new URL(req.url, "http://h");
+  if (req.method === "POST" && (u.pathname === "/api/swipe/answer" || u.pathname === "/api/swipe/edit")) {
+    if (!adminHash || sha(tokenOf(req.url)) !== adminHash) { res.writeHead(403, { "content-type": "application/json" }); return res.end('{"error":"Admin link required"}'); }
+    let j; try { j = JSON.parse((body || "").toString()); } catch (e) { j = null; }
+    if (!j || typeof j.id !== "string" || PENDING.length >= 1000) { res.writeHead(400, { "content-type": "application/json" }); return res.end('{"error":"Bad request"}'); }
+    PENDING.push({ path: u.pathname, url: req.url, body: (body || "").toString(), at: new Date().toISOString() });
+    let card = null;
+    if (u.pathname === "/api/swipe/answer") patchSwipe(req.url, (s) => { s.cards = (s.cards || []).filter((c) => c.id !== j.id); });
+    else patchSwipe(req.url, (s) => { for (const c of s.cards || []) if (c.id === j.id) { if (typeof j.text === "string") { c.draft_text = j.text; c.edited = true; } card = c; } });
+    res.writeHead(200, { "content-type": "application/json", "x-served-from": "offline-queue" });
+    return res.end(JSON.stringify({ ok: true, queued: true, duplicate: false, answer: j.answer, card }));
+  }
+  if (req.method === "GET" || req.method === "HEAD") {
+    let k = ckey(req.url); if (k === "/") k = "/index.html";
+    const c = CACHE.get(k) || CACHE.get(ckey(req.url.replace(/^\/(\?|$)/, "/index.html$1")));
+    if (c) { res.writeHead(200, Object.assign({}, c.h, { "x-served-from": "offline-cache", "x-cached-at": new Date(c.at).toISOString(), "cache-control": "no-store" })); return res.end(req.method === "HEAD" ? undefined : c.b); }
+  }
+  res.writeHead(503, { "content-type": "text/plain" }); return res.end("The office computer is offline right now. This page has no saved copy yet. Please try again shortly.");
+}
 http.createServer(async (req, res) => {
-  if (req.url === "/healthz") { res.writeHead(200); return res.end("ok"); }
+  if (req.url === "/healthz") { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ ok: true, relay: Date.now() - agentSeen < 45000, cached: CACHE.size, queued: PENDING.length })); }
   if (req.url.startsWith("/__relay/")) {
     if (!okKey(req.headers["x-relay-key"])) { res.writeHead(403); return res.end(); }
     agentSeen = Date.now();
@@ -48,19 +91,31 @@ http.createServer(async (req, res) => {
       try { const m = JSON.parse(Buffer.concat(cs).toString()); const f = inflight.get(m.id); if (f) f.resolve(m); } catch (e) { }
       res.writeHead(204); return res.end();
     }
+    if (req.url.startsWith("/__relay/cache")) { // box snapshot push: {items:[{url,status,headers,body}], admin_hash}
+      const cs = []; for await (const c of req) cs.push(c);
+      try { const m = JSON.parse(Buffer.concat(cs).toString()); if (m.admin_hash) adminHash = m.admin_hash; for (const it of m.items || []) if (it.status === 200) cput(it.url, it); } catch (e) { }
+      res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ cached: CACHE.size, bytes: cacheBytes }));
+    }
+    if (req.url.startsWith("/__relay/queue")) { // box drains offline approvals
+      const out = PENDING.splice(0, PENDING.length);
+      res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ items: out }));
+    }
+    if (req.url.startsWith("/__relay/requeue")) { const cs = []; for await (const c of req) cs.push(c); try { PENDING.unshift(...JSON.parse(Buffer.concat(cs).toString()).items); } catch (e) { } res.writeHead(204); return res.end(); }
     res.writeHead(404); return res.end();
   }
   const relayLive = Date.now() - agentSeen < 45000;
   if (!relayLive && !target) await loadTarget();
-  if (!relayLive && !target) { res.writeHead(503, { "content-type": "text/plain" }); return res.end("Scoreboard is starting up. Please refresh in a minute."); }
   const chunks = []; for await (const c of req) chunks.push(c);
   const body = chunks.length ? Buffer.concat(chunks) : undefined;
+  if (!relayLive && !target) return offline(req, res, body);
   if (relayLive) {
     try {
       const m = await viaRelay(req, body);
       const out = {}; for (const [k, v] of Object.entries(m.headers || {})) if (!HOP.has(k) && k !== "content-encoding") out[k] = v;
+      if (req.method === "GET" && m.status === 200) cput(req.url, m);
       res.writeHead(m.status || 502, out); return res.end(Buffer.from(m.body || "", "base64"));
-    } catch (e) { if (!target) { res.writeHead(502, { "content-type": "text/plain" }); return res.end("Scoreboard is restarting. Please refresh in a minute."); } }
+    } catch (e) { if (!target) return offline(req, res, body);
+      if (false) { res.writeHead(502, { "content-type": "text/plain" }); return res.end("Scoreboard is restarting. Please refresh in a minute."); } }
   }
   const headers = {}; for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k)) headers[k] = v;
   async function go() { return fetch(target + req.url, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : body, redirect: "manual" }); }
@@ -68,6 +123,7 @@ http.createServer(async (req, res) => {
     let r; try { r = await go(); } catch (e) { await loadTarget(); r = await go(); }
     const out = {}; r.headers.forEach((v, k) => { if (!HOP.has(k) && k !== "content-encoding") out[k] = v; });
     const buf = Buffer.from(await r.arrayBuffer());
+    if (r.status >= 500) return offline(req, res, body);
     res.writeHead(r.status, out); res.end(buf);
-  } catch (e) { res.writeHead(502, { "content-type": "text/plain" }); res.end("Scoreboard is restarting. Please refresh in a minute."); }
+  } catch (e) { return offline(req, res, body); }
 }).listen(process.env.PORT || 10000);
