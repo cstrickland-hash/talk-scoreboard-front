@@ -13,13 +13,18 @@ function dispatch(item) {
   while (waiters.length) { const w = waiters.shift(); clearTimeout(w.t); if (!w.res.destroyed) { w.res.writeHead(200, { "content-type": "application/json" }); w.res.end(JSON.stringify(item)); return; } }
   queue.push(item);
 }
-function viaRelay(req, body) {
+// Oct 17 2026: a relay agent counts as live for 35 s after its last poll (polls last 25 s). Requests that sat in the queue
+// past their deadline are dropped instead of being replayed when the box wakes up. A GET that has a saved copy waits at most
+// 8 s for the box before the saved copy is served, so a sleeping box never shows a blank page.
+const RELAY_WINDOW = 35000;
+function viaRelay(req, body, ms) {
   return new Promise((resolve, reject) => {
     const id = String(++seq) + "-" + crypto.randomBytes(4).toString("hex");
-    const t = setTimeout(() => { inflight.delete(id); reject(new Error("relay timeout")); }, 30000);
+    ms = ms || 30000;
+    const t = setTimeout(() => { inflight.delete(id); reject(new Error("relay timeout")); }, ms);
     inflight.set(id, { resolve: (r) => { clearTimeout(t); inflight.delete(id); resolve(r); } });
     const headers = {}; for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k)) headers[k] = v;
-    dispatch({ id, method: req.method, url: req.url, headers, body: body ? body.toString("base64") : "" });
+    dispatch({ id, exp: Date.now() + ms, method: req.method, url: req.url, headers, body: body ? body.toString("base64") : "" });
   });
 }
 const TARGET_FILE = process.env.TARGET_FILE_URL || "https://raw.githubusercontent.com/cstrickland-hash/talk-scoreboard-front/main/target.txt";
@@ -76,11 +81,12 @@ function offline(req, res, body) {
   res.writeHead(503, { "content-type": "text/plain" }); return res.end("The office computer is offline right now. This page has no saved copy yet. Please try again shortly.");
 }
 http.createServer(async (req, res) => {
-  if (req.url === "/healthz") { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ ok: true, relay: Date.now() - agentSeen < 45000, cached: CACHE.size, queued: PENDING.length })); }
+  if (req.url === "/healthz") { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ ok: true, relay: Date.now() - agentSeen < RELAY_WINDOW, cached: CACHE.size, queued: PENDING.length })); }
   if (req.url.startsWith("/__relay/")) {
     if (!okKey(req.headers["x-relay-key"])) { res.writeHead(403); return res.end(); }
     agentSeen = Date.now();
     if (req.url.startsWith("/__relay/poll")) {
+      while (queue.length && queue[0].exp && queue[0].exp < Date.now()) queue.shift();
       if (queue.length) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify(queue.shift())); }
       const w = { res, t: setTimeout(() => { const i = waiters.indexOf(w); if (i >= 0) waiters.splice(i, 1); if (!res.destroyed) { res.writeHead(204); res.end(); } }, 25000) };
       waiters.push(w); req.on("close", () => { const i = waiters.indexOf(w); if (i >= 0) { waiters.splice(i, 1); clearTimeout(w.t); } });
@@ -103,16 +109,18 @@ http.createServer(async (req, res) => {
     if (req.url.startsWith("/__relay/requeue")) { const cs = []; for await (const c of req) cs.push(c); try { PENDING.unshift(...JSON.parse(Buffer.concat(cs).toString()).items); } catch (e) { } res.writeHead(204); return res.end(); }
     res.writeHead(404); return res.end();
   }
-  const relayLive = Date.now() - agentSeen < 45000;
+  const relayLive = Date.now() - agentSeen < RELAY_WINDOW;
   if (!relayLive && !target) await loadTarget();
   const chunks = []; for await (const c of req) chunks.push(c);
   const body = chunks.length ? Buffer.concat(chunks) : undefined;
   if (!relayLive && !target) return offline(req, res, body);
   if (relayLive) {
     try {
-      const m = await viaRelay(req, body);
+      const hasCopy = (req.method === "GET" || req.method === "HEAD") && CACHE.has(ckey(req.url));
+      const m = await viaRelay(req, body, hasCopy ? 8000 : 30000);
       const out = {}; for (const [k, v] of Object.entries(m.headers || {})) if (!HOP.has(k) && k !== "content-encoding") out[k] = v;
       if (req.method === "GET" && m.status === 200) cput(req.url, m);
+      if (m.status >= 500 && m.status !== 501) return offline(req, res, body); // box server restarting: use the saved copy
       res.writeHead(m.status || 502, out); return res.end(Buffer.from(m.body || "", "base64"));
     } catch (e) { if (!target) return offline(req, res, body);
       if (false) { res.writeHead(502, { "content-type": "text/plain" }); return res.end("Scoreboard is restarting. Please refresh in a minute."); } }
