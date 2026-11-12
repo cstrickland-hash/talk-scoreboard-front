@@ -60,8 +60,30 @@ function patchSwipe(u, fn) { // update every cached /api/swipe list for this tok
     try { const j = JSON.parse(v.b.toString()); fn(j); j.count = (j.cards || []).length; const nb = Buffer.from(JSON.stringify(j)); cacheBytes += nb.length - v.b.length; v.b = nb; } catch (e) { }
   }
 }
+// Nov 11 2026 (t4345u): once a Task Desk action succeeds, patch every saved /api/desk/v2 copy so a box pause can never
+// show that card as Pending again (a stale saved copy was able to resurrect cards Christopher had already sent).
+function patchDesk(reqBody, status) {
+  if (status !== 200) return;
+  let j; try { j = JSON.parse((reqBody || "").toString()); } catch (e) { return; }
+  if (!j || typeof j.id !== "string" || !j.action || j.action === "saveedit") return;
+  const OPEN = ["notsent", "donow", "calls", "tomorrow", "later", "snoozed"];
+  const sentish = ["send", "sendnow", "sendlater"].includes(j.action);
+  for (const [k, v] of CACHE) if (k.startsWith("/api/desk/v2")) {
+    try {
+      const d = JSON.parse(v.b.toString()); const g = d.groups || {}; let moved = null;
+      for (const name of OPEN) if (Array.isArray(g[name])) { const i = g[name].findIndex((c) => c.id === j.id); if (i >= 0) { moved = g[name].splice(i, 1)[0]; } }
+      if (moved && sentish) { moved.chip = j.action === "sendlater" ? "Scheduled" : "Sending"; (g[j.action === "sendlater" ? "scheduled" : "sentToday"] = g[j.action === "sendlater" ? "scheduled" : "sentToday"] || []).unshift(moved); }
+      if (moved) { d.needsMe = (g.notsent || []).length + (g.donow || []).length + (g.calls || []).length; d.patchedOffline = true;
+        const nb = Buffer.from(JSON.stringify(d)); cacheBytes += nb.length - v.b.length; v.b = nb; }
+    } catch (e) { }
+  }
+}
 function offline(req, res, body) {
   const u = new URL(req.url, "http://h");
+  if (req.method === "POST" && u.pathname.startsWith("/api/desk/")) { // desk actions are never queued or replayed later
+    res.writeHead(503, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "The office computer is paused for a minute. Nothing was sent or changed. Please try again shortly." }));
+  }
   if (req.method === "POST" && (u.pathname === "/api/swipe/answer" || u.pathname === "/api/swipe/edit")) {
     if (!adminHash || sha(tokenOf(req.url)) !== adminHash) { res.writeHead(403, { "content-type": "application/json" }); return res.end('{"error":"Admin link required"}'); }
     let j; try { j = JSON.parse((body || "").toString()); } catch (e) { j = null; }
@@ -120,6 +142,7 @@ http.createServer(async (req, res) => {
       const m = await viaRelay(req, body, hasCopy ? 8000 : 30000);
       const out = {}; for (const [k, v] of Object.entries(m.headers || {})) if (!HOP.has(k) && k !== "content-encoding") out[k] = v;
       if (req.method === "GET" && m.status === 200) cput(req.url, m);
+      if (req.method === "POST" && req.url.startsWith("/api/desk/act")) patchDesk(body, m.status);
       if (m.status >= 500 && m.status !== 501) return offline(req, res, body); // box server restarting: use the saved copy
       res.writeHead(m.status || 502, out); return res.end(Buffer.from(m.body || "", "base64"));
     } catch (e) { if (!target) return offline(req, res, body);
@@ -132,6 +155,7 @@ http.createServer(async (req, res) => {
     const out = {}; r.headers.forEach((v, k) => { if (!HOP.has(k) && k !== "content-encoding") out[k] = v; });
     const buf = Buffer.from(await r.arrayBuffer());
     if (r.status >= 500) return offline(req, res, body);
+    if (req.method === "POST" && req.url.startsWith("/api/desk/act")) patchDesk(body, r.status);
     res.writeHead(r.status, out); res.end(buf);
   } catch (e) { return offline(req, res, body); }
 }).listen(process.env.PORT || 10000);
