@@ -132,30 +132,20 @@ http.createServer(async (req, res) => {
     res.writeHead(404); return res.end();
   }
   const relayLive = Date.now() - agentSeen < RELAY_WINDOW;
-  if (!relayLive && !target) await loadTarget();
   const chunks = []; for await (const c of req) chunks.push(c);
   const body = chunks.length ? Buffer.concat(chunks) : undefined;
-  if (!relayLive && !target) return offline(req, res, body);
-  if (relayLive) {
-    try {
-      const hasCopy = (req.method === "GET" || req.method === "HEAD") && CACHE.has(ckey(req.url));
-      const m = await viaRelay(req, body, hasCopy ? 8000 : 30000);
-      const out = {}; for (const [k, v] of Object.entries(m.headers || {})) if (!HOP.has(k) && k !== "content-encoding") out[k] = v;
-      if (req.method === "GET" && m.status === 200) cput(req.url, m);
-      if (req.method === "POST" && req.url.startsWith("/api/desk/act")) patchDesk(body, m.status);
-      if (m.status >= 500 && m.status !== 501) return offline(req, res, body); // box server restarting: use the saved copy
-      res.writeHead(m.status || 502, out); return res.end(Buffer.from(m.body || "", "base64"));
-    } catch (e) { if (!target) return offline(req, res, body);
-      if (false) { res.writeHead(502, { "content-type": "text/plain" }); return res.end("Scoreboard is restarting. Please refresh in a minute."); } }
-  }
-  const headers = {}; for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k)) headers[k] = v;
-  async function go() { return fetch(target + req.url, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : body, redirect: "manual" }); }
+  // Nov 23 2026 (t5864u): never fall through to the old trycloudflare target when the
+  // box is paused or the relay times out. That hostname is dead, and from Render it
+  // can hang until TCP/TLS gives up, which froze the Task Desk. Serve the saved copy
+  // (or a short pause error for desk POSTs) instead.
+  if (!relayLive) return offline(req, res, body);
   try {
-    let r; try { r = await go(); } catch (e) { await loadTarget(); r = await go(); }
-    const out = {}; r.headers.forEach((v, k) => { if (!HOP.has(k) && k !== "content-encoding") out[k] = v; });
-    const buf = Buffer.from(await r.arrayBuffer());
-    if (r.status >= 500) return offline(req, res, body);
-    if (req.method === "POST" && req.url.startsWith("/api/desk/act")) patchDesk(body, r.status);
-    res.writeHead(r.status, out); res.end(buf);
+    const hasCopy = (req.method === "GET" || req.method === "HEAD") && CACHE.has(ckey(req.url));
+    const m = await viaRelay(req, body, hasCopy ? 8000 : 30000);
+    const out = {}; for (const [k, v] of Object.entries(m.headers || {})) if (!HOP.has(k) && k !== "content-encoding") out[k] = v;
+    if (req.method === "GET" && m.status === 200) cput(req.url, m);
+    if (req.method === "POST" && req.url.startsWith("/api/desk/act")) patchDesk(body, m.status);
+    if (m.status >= 500 && m.status !== 501) return offline(req, res, body); // box server restarting: use the saved copy
+    res.writeHead(m.status || 502, out); return res.end(Buffer.from(m.body || "", "base64"));
   } catch (e) { return offline(req, res, body); }
 }).listen(process.env.PORT || 10000);
