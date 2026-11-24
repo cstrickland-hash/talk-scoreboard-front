@@ -28,6 +28,9 @@ function viaRelay(req, body, ms) {
   });
 }
 const TARGET_FILE = process.env.TARGET_FILE_URL || "https://raw.githubusercontent.com/cstrickland-hash/talk-scoreboard-front/main/target.txt";
+// Nov 23 2026 (t5907u): when Render restarts (free plan sleep) its memory cache is empty.
+// Fall back to the always-on Cloudflare copy so the Task Desk still loads.
+const CF_DESK = "https://talk-task-desk.talkrealty-desk.workers.dev";
 let target = "";
 async function loadTarget() {
   try {
@@ -100,7 +103,32 @@ function offline(req, res, body) {
     const c = CACHE.get(k) || CACHE.get(ckey(req.url.replace(/^\/(\?|$)/, "/index.html$1")));
     if (c) { res.writeHead(200, Object.assign({}, c.h, { "x-served-from": "offline-cache", "x-cached-at": new Date(c.at).toISOString(), "cache-control": "no-store" })); return res.end(req.method === "HEAD" ? undefined : c.b); }
   }
-  res.writeHead(503, { "content-type": "text/plain" }); return res.end("The office computer is offline right now. This page has no saved copy yet. Please try again shortly.");
+  return fromCf(req, res);
+}
+
+async function fromCf(req, res) {
+  const u = new URL(req.url, "http://h");
+  const okPath = u.pathname === "/desk.html" || u.pathname === "/desk.webmanifest" || u.pathname.startsWith("/api/desk") || u.pathname.startsWith("/assets/desk-");
+  if ((req.method !== "GET" && req.method !== "HEAD") || !okPath) {
+    res.writeHead(503, { "content-type": "text/plain" });
+    return res.end("The office computer is offline right now. This page has no saved copy yet. Please try again shortly.");
+  }
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 4000);
+    const r = await fetch(CF_DESK + req.url, { method: req.method, signal: ac.signal, redirect: "manual", headers: { "user-agent": "talk-scoreboard-cf-fallback", "cache-control": "no-store" } });
+    clearTimeout(t);
+    if (r.status >= 500) throw new Error("cf " + r.status);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const out = { "cache-control": "no-store", "x-served-from": "cf-fallback", "x-robots-tag": "noindex" };
+    const ct = r.headers.get("content-type"); if (ct) out["content-type"] = ct;
+    if (req.method === "GET" && r.status === 200) cput(req.url, { status: r.status, headers: out, body: buf.toString("base64") });
+    res.writeHead(r.status, out);
+    return res.end(req.method === "HEAD" ? undefined : buf);
+  } catch (e) {
+    res.writeHead(503, { "content-type": "text/plain" });
+    return res.end("The office computer is offline right now. This page has no saved copy yet. Please try again shortly.");
+  }
 }
 http.createServer(async (req, res) => {
   if (req.url === "/healthz") { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ ok: true, relay: Date.now() - agentSeen < RELAY_WINDOW, cached: CACHE.size, queued: PENDING.length })); }
@@ -138,14 +166,14 @@ http.createServer(async (req, res) => {
   // box is paused or the relay times out. That hostname is dead, and from Render it
   // can hang until TCP/TLS gives up, which froze the Task Desk. Serve the saved copy
   // (or a short pause error for desk POSTs) instead.
-  if (!relayLive) return offline(req, res, body);
+  if (!relayLive) return await offline(req, res, body);
   try {
     const hasCopy = (req.method === "GET" || req.method === "HEAD") && CACHE.has(ckey(req.url));
     const m = await viaRelay(req, body, hasCopy ? 8000 : 30000);
     const out = {}; for (const [k, v] of Object.entries(m.headers || {})) if (!HOP.has(k) && k !== "content-encoding") out[k] = v;
     if (req.method === "GET" && m.status === 200) cput(req.url, m);
     if (req.method === "POST" && req.url.startsWith("/api/desk/act")) patchDesk(body, m.status);
-    if (m.status >= 500 && m.status !== 501) return offline(req, res, body); // box server restarting: use the saved copy
+    if (m.status >= 500 && m.status !== 501) return await offline(req, res, body); // box server restarting: use the saved copy
     res.writeHead(m.status || 502, out); return res.end(Buffer.from(m.body || "", "base64"));
-  } catch (e) { return offline(req, res, body); }
+  } catch (e) { return await offline(req, res, body); }
 }).listen(process.env.PORT || 10000);
